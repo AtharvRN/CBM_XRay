@@ -14,19 +14,43 @@ from torch.utils.data import DataLoader, TensorDataset
 parser = argparse.ArgumentParser(description='Settings for creating CBM')
 
 
-parser.add_argument("--dataset", type=str, default="cifar10")
+parser.add_argument("--dataset", type=str, default="nih14")
 parser.add_argument("--concept_set", type=str, default=None, 
                     help="path to concept set name")
-parser.add_argument("--backbone", type=str, default="clip_RN50", help="Which pretrained model to use as backbone")
-parser.add_argument("--clip_name", type=str, default="ViT-B/16", help="Which CLIP model to use")
+parser.add_argument("--backbone", type=str, default="xrv_densenet121-res224-nih",
+                    help="TorchXRayVision weights string, e.g., xrv_densenet121-res224-nih")
+parser.add_argument("--backbone_ckpt", type=str, default=None,
+                    help="Optional path to a fine-tuned backbone state dict")
+parser.add_argument("--clip_name", type=str, default="biomedclip", help="Which CLIP model to use")
+parser.add_argument("--nih_img_dir", type=str, default=None,
+                    help="Directory containing NIH ChestXray14 images (required for nih14 dataset)")
+parser.add_argument("--nih_train_fraction", type=float, default=0.9,
+                    help="Fraction of NIH data to use for training split")
+parser.add_argument("--nih_split_seed", type=int, default=0,
+                    help="Random seed for NIH train/val split")
+parser.add_argument("--nih_views", type=str, default="PA",
+                    help="Comma-separated list of view positions to include for NIH data (e.g., 'PA,AP')")
+parser.add_argument("--nih_csv_path", type=str, default=None,
+                    help="Path to NIH Data_Entry CSV (defaults to torchxrayvision bundled file)")
+
+parser.add_argument("--chex_img_dir", type=str, default=None,
+                    help="Directory containing CheXpert images (required for chex dataset)")
+parser.add_argument("--chex_train_fraction", type=float, default=0.9,
+                    help="Fraction of CheXpert data to use for training split")
+parser.add_argument("--chex_split_seed", type=int, default=0,
+                    help="Random seed for CheXpert train/val split")
+parser.add_argument("--chex_views", type=str, default="PA",
+                    help="Comma-separated list of views to include for CheXpert")
+parser.add_argument("--chex_csv_path", type=str, default=None,
+                    help="Path to CheXpert CSV (defaults to torchxrayvision bundled file)")
+parser.add_argument("--chex_val_csv_path", type=str, default=None,
+                    help="Optional path to CheXpert validation CSV (uses official val set if provided)")
 
 parser.add_argument("--device", type=str, default="cuda", help="Which device to use")
 parser.add_argument("--batch_size", type=int, default=512, help="Batch size used when saving model/CLIP activations")
 parser.add_argument("--saga_batch_size", type=int, default=256, help="Batch size used when fitting final layer")
 parser.add_argument("--proj_batch_size", type=int, default=50000, help="Batch size to use when learning projection layer")
 
-parser.add_argument("--feature_layer", type=str, default='layer4', 
-                    help="Which layer to collect activations from. Should be the name of second to last layer in the model")
 parser.add_argument("--activation_dir", type=str, default='saved_activations', help="save location for backbone and CLIP activations")
 parser.add_argument("--save_dir", type=str, default='saved_models', help="where to save trained models")
 parser.add_argument("--clip_cutoff", type=float, default=0.25, help="concepts with smaller top5 clip activation will be deleted")
@@ -35,13 +59,33 @@ parser.add_argument("--interpretability_cutoff", type=float, default=0.45, help=
 parser.add_argument("--lam", type=float, default=0.0007, help="Sparsity regularization parameter, higher->more sparse")
 parser.add_argument("--n_iters", type=int, default=1000, help="How many iterations to run the final layer solver for")
 parser.add_argument("--print", action='store_true', help="Print all concepts being deleted in this stage")
+parser.add_argument("--num_workers", type=int, default=8, help="Num workers for data loading when saving activations")
 
 def train_cbm_and_save(args):
     
     if not os.path.exists(args.save_dir):
         os.mkdir(args.save_dir)
     if args.concept_set==None:
-        args.concept_set = "data/concept_sets/{}_filtered.txt".format(args.dataset)
+        if args.dataset == "nih14":
+            args.concept_set = "data/concept_sets/nih14_biomedclip.txt"
+        else:
+            args.concept_set = "data/concept_sets/{}_filtered.txt".format(args.dataset)
+
+    if args.dataset == "nih14":
+        views = [v.strip() for v in args.nih_views.split(",") if v.strip()]
+        data_utils.configure_nih_dataset(img_dir=args.nih_img_dir,
+                                         csv_path=args.nih_csv_path,
+                                         train_fraction=args.nih_train_fraction,
+                                         split_seed=args.nih_split_seed,
+                                         views=views)
+    elif args.dataset == "chex":
+        views = [v.strip() for v in args.chex_views.split(",") if v.strip()]
+        data_utils.configure_chex_dataset(img_dir=args.chex_img_dir,
+                                          csv_path=args.chex_csv_path,
+                                          val_csv_path=args.chex_val_csv_path,
+                                          train_fraction=args.chex_train_fraction,
+                                          split_seed=args.chex_split_seed,
+                                          views=views)
         
     similarity_fn = similarity.cos_similarity_cubed_single
     
@@ -51,22 +95,25 @@ def train_cbm_and_save(args):
     #get concept set
     cls_file = data_utils.LABEL_FILES[args.dataset]
     with open(cls_file, "r") as f:
-        classes = f.read().split("\n")
+        classes = [c for c in f.read().split("\n") if len(c)]
+    multilabel = args.dataset in data_utils.MULTILABEL_DATASETS
+    args.is_multilabel = multilabel
     
     with open(args.concept_set) as f:
-        concepts = f.read().split("\n")
+        concepts = [c for c in f.read().split("\n") if len(c)]
     
     #save activations and get save_paths
     for d_probe in [d_train, d_val]:
-        utils.save_activations(clip_name = args.clip_name, target_name = args.backbone, 
-                               target_layers = [args.feature_layer], d_probe = d_probe,
-                               concept_set = args.concept_set, batch_size = args.batch_size, 
-                               device = args.device, pool_mode = "avg", save_dir = args.activation_dir)
+        utils.save_activations(clip_name = args.clip_name, target_name = args.backbone,
+                               d_probe = d_probe, concept_set = args.concept_set,
+                               batch_size = args.batch_size, device = args.device,
+                               save_dir = args.activation_dir, num_workers=args.num_workers,
+                               backbone_ckpt=args.backbone_ckpt)
         
-    target_save_name, clip_save_name, text_save_name = utils.get_save_names(args.clip_name, args.backbone, 
-                                            args.feature_layer,d_train, args.concept_set, "avg", args.activation_dir)
+    target_save_name, clip_save_name, text_save_name = utils.get_save_names(args.clip_name, args.backbone,
+                                            d_train, args.concept_set, args.activation_dir)
     val_target_save_name, val_clip_save_name, text_save_name =  utils.get_save_names(args.clip_name, args.backbone,
-                                            args.feature_layer, d_val, args.concept_set, "avg", args.activation_dir)
+                                            d_val, args.concept_set, args.activation_dir)
     
     #load features
     with torch.no_grad():
@@ -185,13 +232,19 @@ def train_cbm_and_save(args):
         train_c -= train_mean
         train_c /= train_std
         
-        train_y = torch.LongTensor(train_targets)
+        train_targets = torch.as_tensor(train_targets)
+        val_targets = torch.as_tensor(val_targets)
+
+        if multilabel:
+            train_y = train_targets.float()
+            val_y = val_targets.float()
+        else:
+            train_y = train_targets.long()
+            val_y = val_targets.long()
         indexed_train_ds = IndexedTensorDataset(train_c, train_y)
 
         val_c -= train_mean
         val_c /= train_std
-        
-        val_y = torch.LongTensor(val_targets)
 
         val_ds = TensorDataset(val_c,val_y)
 
@@ -211,8 +264,10 @@ def train_cbm_and_save(args):
     metadata['max_reg']['nongrouped'] = args.lam
 
     # Solve the GLM path
+    family = 'multilabel' if multilabel else 'multinomial'
     output_proj = glm_saga(linear, indexed_train_loader, STEP_SIZE, args.n_iters, ALPHA, epsilon=1, k=1,
-                      val_loader=val_loader, do_zero=False, metadata=metadata, n_ex=len(target_features), n_classes = len(classes))
+                      val_loader=val_loader, do_zero=False, metadata=metadata, n_ex=len(target_features),
+                      n_classes = len(classes), family=family)
     W_g = output_proj['path'][0]['weight']
     b_g = output_proj['path'][0]['bias']
     

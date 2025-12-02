@@ -1,0 +1,19 @@
+Atelectasis
+Cardiomegaly
+Consolidation
+Edema
+Effusion
+Emphysema
+Fibrosis
+Hernia
+Infiltration
+Mass
+Nodule
+Pleural_Thickening
+Pneumonia
+Pneumothorax
+Enlarged Cardiomediastinum
+Lung Opacity
+Lung Lesion
+Fracture
+Support Devices
